@@ -6,6 +6,8 @@ from io import BytesIO
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4
@@ -91,6 +93,64 @@ CAMINHO_ACOMPANHAMENTO = os.path.join(
     "Acompanhamento_Acoes_Radar_360.xlsx",
 )
 
+ID_PLANILHA_ACOMPANHAMENTO = (
+    "1WjInAguXhrkdPFpCKYKA5RmWTTKm02S6KkXxMucWrC0"
+)
+
+NOME_ABA_ACOMPANHAMENTO = "Acompanhamento_Acoes"
+
+ESCOPO_GOOGLE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def conectar_planilha_acompanhamento():
+    credenciais = Credentials.from_service_account_info(
+        st.secrets["google_service_account"],
+        scopes=ESCOPO_GOOGLE,
+    )
+
+    cliente_google = gspread.authorize(credenciais)
+    planilha = cliente_google.open_by_key(
+        ID_PLANILHA_ACOMPANHAMENTO
+    )
+
+    return planilha.worksheet(
+        NOME_ABA_ACOMPANHAMENTO
+    )
+
+
+def verificar_acesso_cliente():
+    senha_configurada = str(
+        st.secrets.get("acesso_cliente", {}).get("senha", "")
+    ).strip()
+
+    if not senha_configurada:
+        st.error(
+            "A senha do cliente ainda não foi configurada nos Secrets do Streamlit."
+        )
+        st.stop()
+
+    if st.session_state.get("cliente_autenticado", False):
+        return
+
+    st.markdown("### Acesso ao Painel do Cliente")
+    senha_informada = st.text_input(
+        "Senha",
+        type="password",
+        key="senha_acesso_cliente",
+    )
+
+    if st.button("Entrar", type="primary"):
+        if senha_informada == senha_configurada:
+            st.session_state["cliente_autenticado"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+
+    st.stop()
+
 
 def moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -101,19 +161,73 @@ def carregar_base(caminho):
     return pd.read_excel(caminho, sheet_name=None)
 
 
-def carregar_acompanhamento(caminho):
-    if not os.path.exists(caminho):
-        return pd.DataFrame()
-
+def carregar_acompanhamento(caminho=None):
     try:
-        df = pd.read_excel(
-            caminho,
-            sheet_name="Acompanhamento_Acoes",
-        )
+        aba = conectar_planilha_acompanhamento()
+        registros = aba.get_all_records()
+
+        if not registros:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(registros)
         return df.dropna(how="all")
-    except Exception:
+
+    except Exception as erro:
+        st.error(
+            f"Não foi possível carregar o acompanhamento do Google Sheets: {erro}"
+        )
         return pd.DataFrame()
 
+
+def salvar_acompanhamento(caminho, registro):
+    aba = conectar_planilha_acompanhamento()
+
+    cabecalhos = aba.row_values(1)
+    id_acao = str(registro["ID_Acao"])
+
+    coluna_id = cabecalhos.index("ID_Acao") + 1
+    valores_id = aba.col_values(coluna_id)
+
+    linha_encontrada = None
+
+    for numero_linha, valor_id in enumerate(valores_id[1:], start=2):
+        if str(valor_id) == id_acao:
+            linha_encontrada = numero_linha
+            break
+
+    linha_registro = []
+
+    for cabecalho in cabecalhos:
+        valor = registro.get(cabecalho, "")
+
+        if valor is None:
+            valor = ""
+        elif isinstance(valor, pd.Timestamp):
+            valor = valor.strftime("%d/%m/%Y %H:%M:%S")
+        elif hasattr(valor, "strftime"):
+            valor = valor.strftime("%d/%m/%Y")
+        elif pd.isna(valor):
+            valor = ""
+
+        linha_registro.append(valor)
+
+    if linha_encontrada is None:
+        aba.append_row(
+            linha_registro,
+            value_input_option="USER_ENTERED",
+        )
+    else:
+        ultima_celula = gspread.utils.rowcol_to_a1(
+            linha_encontrada,
+            len(cabecalhos),
+        )
+        intervalo = f"A{linha_encontrada}:{ultima_celula}"
+
+        aba.update(
+            intervalo,
+            [linha_registro],
+            value_input_option="USER_ENTERED",
+        )
 
 
 def gerar_pdf_executivo(imoveis, proprietarios, acompanhamento):
@@ -1632,6 +1746,8 @@ except Exception as erro:
     st.error(f"Não foi possível carregar a base: {erro}")
     st.stop()
 
+verificar_acesso_cliente()
+
 tema = st.sidebar.radio(
     "Tema",
     ["Claro", "Escuro"],
@@ -2556,8 +2672,195 @@ if pagina == "Plano de Ação":
 
     st.divider()
 
+    with st.expander("Registrar acompanhamento de uma ação", expanded=False):
+        opcoes_acoes = plano_priorizado["ID_Imovel"].tolist()
+
+        imovel_acao = st.selectbox(
+            "Selecione o imóvel",
+            options=opcoes_acoes,
+            key="acao_imovel_selecionado",
+        )
+
+        dados_acao = plano_priorizado.loc[
+            plano_priorizado["ID_Imovel"] == imovel_acao
+        ].iloc[0]
+
+        acompanhamento = carregar_acompanhamento(
+            CAMINHO_ACOMPANHAMENTO
+        )
+
+        id_acao = f"ACAO-{imovel_acao}"
+
+        registro_existente = pd.DataFrame()
+
+        if not acompanhamento.empty and "ID_Acao" in acompanhamento.columns:
+            registro_existente = acompanhamento[
+                acompanhamento["ID_Acao"].astype(str) == id_acao
+            ]
+
+        existente = (
+            registro_existente.iloc[0]
+            if not registro_existente.empty
+            else None
+        )
+
+        status_padrao = (
+            str(existente["Status"])
+            if existente is not None
+            and pd.notna(existente.get("Status"))
+            else "Não iniciado"
+        )
+
+        responsavel_padrao = (
+            str(existente["Responsavel"])
+            if existente is not None
+            and pd.notna(existente.get("Responsavel"))
+            else ""
+        )
+
+        observacao_padrao = (
+            str(existente["Observacao"])
+            if existente is not None
+            and pd.notna(existente.get("Observacao"))
+            else ""
+        )
+
+        resultado_padrao = (
+            float(existente["Resultado_Recuperado"])
+            if existente is not None
+            and pd.notna(existente.get("Resultado_Recuperado"))
+            else 0.0
+        )
+
+        data_limite_padrao = pd.Timestamp.today().date()
+
+        if (
+            existente is not None
+            and pd.notna(existente.get("Data_Limite"))
+        ):
+            data_limite_padrao = pd.to_datetime(
+                existente["Data_Limite"]
+            ).date()
+
+        st.markdown(
+            f"**Ação:** {dados_acao['Ação prioritária']}  \n"
+            f"**Índice:** {int(dados_acao['Indice_Risco_Imovel'])} | "
+            f"**Impacto mensal:** {moeda(dados_acao['Impacto_Plano'])}"
+        )
+
+        with st.form("form_acompanhamento_acao"):
+            c1, c2, c3 = st.columns([1.2, 1, 1])
+
+            with c1:
+                responsavel = st.text_input(
+                    "Responsável",
+                    value=responsavel_padrao,
+                )
+
+            with c2:
+                opcoes_status = [
+                    "Não iniciado",
+                    "Em andamento",
+                    "Aguardando",
+                    "Concluído",
+                    "Cancelado",
+                ]
+                indice_status = (
+                    opcoes_status.index(status_padrao)
+                    if status_padrao in opcoes_status
+                    else 0
+                )
+                status = st.selectbox(
+                    "Status",
+                    options=opcoes_status,
+                    index=indice_status,
+                )
+
+            with c3:
+                data_limite = st.date_input(
+                    "Data limite",
+                    value=data_limite_padrao,
+                    format="DD/MM/YYYY",
+                )
+
+            observacao = st.text_area(
+                "Observação",
+                value=observacao_padrao,
+                height=90,
+            )
+
+            resultado_recuperado = st.number_input(
+                "Resultado recuperado",
+                min_value=0.0,
+                value=resultado_padrao,
+                step=100.0,
+                format="%.2f",
+            )
+
+            salvar = st.form_submit_button(
+                "Salvar acompanhamento",
+                use_container_width=False,
+            )
+
+        if salvar:
+            agora = pd.Timestamp.now().to_pydatetime()
+
+            data_criacao = agora
+            if (
+                existente is not None
+                and pd.notna(existente.get("Data_Criacao"))
+            ):
+                data_criacao = pd.to_datetime(
+                    existente["Data_Criacao"]
+                ).to_pydatetime()
+
+            data_conclusao = None
+            if status == "Concluído":
+                data_conclusao = agora
+
+            registro = {
+                "ID_Acao": id_acao,
+                "ID_Imovel": imovel_acao,
+                "Acao_Prioritaria": dados_acao["Ação prioritária"],
+                "Fator_Principal": dados_acao["Fator_Principal"],
+                "Indice_Risco": int(
+                    dados_acao["Indice_Risco_Imovel"]
+                ),
+                "Impacto_Mensal": float(
+                    dados_acao["Impacto_Plano"]
+                ),
+                "Prazo_Sugerido": dados_acao["Prazo sugerido"],
+                "Responsavel": responsavel.strip(),
+                "Status": status,
+                "Data_Criacao": data_criacao,
+                "Data_Limite": data_limite,
+                "Observacao": observacao.strip(),
+                "Data_Conclusao": data_conclusao,
+                "Resultado_Recuperado": float(
+                    resultado_recuperado
+                ),
+            }
+
+            try:
+                salvar_acompanhamento(
+                    CAMINHO_ACOMPANHAMENTO,
+                    registro,
+                )
+                st.success("Acompanhamento salvo com sucesso.")
+            except PermissionError:
+                st.error(
+                    "Não foi possível salvar. Feche a planilha "
+                    "Acompanhamento_Acoes_Radar_360.xlsx no Excel "
+                    "e tente novamente."
+                )
+            except Exception as erro:
+                st.error(
+                    f"Não foi possível salvar o acompanhamento: {erro}"
+                )
+
     st.caption(
-        "O acompanhamento é exibido em modo de consulta. Atualizações são realizadas no ambiente administrativo."
+        "Os registros desta etapa são salvos na planilha Google compartilhada "
+        "Acompanhamento Ações Radar 360."
     )
 
 
